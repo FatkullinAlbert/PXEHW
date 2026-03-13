@@ -1,0 +1,175 @@
+---
+- name: Configure PXE server (DHCP/TFTP/HTTP + autoinstall)
+  hosts: pxeserver
+  become: yes
+  tasks:
+    - name: Disable ufw (firewall)
+      systemd:
+        name: ufw
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: Install required packages
+      apt:
+        name:
+          - dnsmasq
+          - apache2
+          - wget
+        state: present
+        update_cache: yes
+
+    - name: Create necessary directories
+      file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - /srv/tftp
+        - /srv/images
+        - /srv/ks
+
+    - name: Download netboot tarball (Ubuntu 24.04)
+      get_url:
+        url: http://ftp.cse.buffalo.edu/mirror/Linux/ubuntu-releases/24.04/ubuntu-24.04.3-netboot-amd64.tar.gz
+        dest: /tmp/noble-netboot-amd64.tar.gz
+      register: netboot_download
+
+    - name: Extract netboot files to TFTP root
+      unarchive:
+        src: /tmp/noble-netboot-amd64.tar.gz
+        dest: /srv/tftp
+        remote_src: yes
+        creates: /srv/tftp/amd64/pxelinux.0
+      when: netboot_download.changed
+
+    - name: Configure dnsmasq (DHCP + TFTP) – адаптировано для ubuntu/jammy64
+      copy:
+        dest: /etc/dnsmasq.d/pxe.conf
+        content: |
+          # Привязка к IP вместо имени интерфейса (переносимость)
+          listen-address=10.0.0.20
+          bind-interfaces
+          # Пул адресов
+          dhcp-range=10.0.0.100,10.0.0.120
+          # Загрузочный файл для Legacy BIOS
+          dhcp-boot=pxelinux.0
+          # UEFI поддержка (для задания со *)
+          dhcp-match=set:efi-x86_64,option:client-arch,7
+          dhcp-boot=tag:efi-x86_64,bootx64.efi
+          # Включить TFTP
+          enable-tftp
+          tftp-root=/srv/tftp/amd64
+      notify: restart dnsmasq
+
+    - name: Download Ubuntu 24.04 ISO (для HTTP-репозитория)
+      get_url:
+        url: http://ftp.cse.buffalo.edu/mirror/Linux/ubuntu-releases/24.04/ubuntu-24.04.3-netboot-amd64.tar.gz
+        dest: /srv/images/noble-live-server-amd64.iso
+      register: iso_download
+
+    - name: Configure Apache virtual host
+      copy:
+        dest: /etc/apache2/sites-available/ks-server.conf
+        content: |
+          <VirtualHost 10.0.0.20:80>
+              DocumentRoot /
+              <Directory /srv/ks>
+                  Options Indexes MultiViews
+                  AllowOverride All
+                  Require all granted
+              </Directory>
+              <Directory /srv/images>
+                  Options Indexes MultiViews
+                  AllowOverride All
+                  Require all granted
+              </Directory>
+          </VirtualHost>
+      notify: restart apache2
+
+    - name: Enable Apache site
+      command: a2ensite ks-server.conf
+      args:
+        creates: /etc/apache2/sites-enabled/ks-server.conf
+      notify: restart apache2
+
+    - name: Configure PXE default menu (BIOS) с autoinstall
+      copy:
+        dest: /srv/tftp/amd64/pxelinux.cfg/default
+        content: |
+          DEFAULT install
+          LABEL install
+          KERNEL linux
+          INITRD initrd
+          APPEND root=/dev/ram0 ramdisk_size=3000000 ip=dhcp iso-url=http://10.0.0.20/srv/images/noble-live-server-amd64.iso autoinstall ds=nocloud-net;s=http://10.0.0.20/srv/ks/
+      notify: restart dnsmasq
+
+    - name: Create user-data for autoinstall
+      copy:
+        dest: /srv/ks/user-data
+        content: |
+          #cloud-config
+          autoinstall:
+            apt:
+              disable_components: []
+              geoip: true
+              preserve_sources_list: false
+              primary:
+                - arches:
+                  - amd64
+                  - i386
+                  uri: http://us.archive.ubuntu.com/ubuntu
+                - arches:
+                  - default
+                  uri: http://ports.ubuntu.com/ubuntu-ports
+            drivers:
+              install: false
+            identity:
+              hostname: linux
+              password: $6$sJgo6Hg5zXBwkkI8$btrEoWAb5FxKhajagWR49XM4EAOfO/Dr5bMrLOkGe3KkMYdsh7T3MU5mYwY2TIMJpVKckAwnZFs2ltUJ1abOZ.
+              realname: otus
+              username: otus
+            kernel:
+              package: linux-generic
+            keyboard:
+              layout: us
+              toggle: null
+              variant: ''
+            locale: en_US.UTF-8
+            network:
+              ethernets:
+                enp0s3:
+                  dhcp4: true
+                enp0s8:
+                  dhcp4: true
+              version: 2
+            ssh:
+              allow-pw: true
+              authorized-keys: []
+              install-server: true
+            updates: security
+            version: 1
+
+    - name: Create empty meta-data
+      copy:
+        dest: /srv/ks/meta-data
+        content: ""
+
+    - name: Ensure services are enabled and running
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - dnsmasq
+        - apache2
+
+  handlers:
+    - name: restart dnsmasq
+      systemd:
+        name: dnsmasq
+        state: restarted
+
+    - name: restart apache2
+      systemd:
+        name: apache2
+        state: restarted
